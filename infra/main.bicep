@@ -174,3 +174,4 @@ output AZURE_AI_SEARCH_ENDPOINT string = search.outputs.searchEndpoint
 output AZURE_AI_SEARCH_KEY string = search.outputs.searchAdminKey
 output AZURE_COSMOS_DB_ENDPOINT string = database.outputs.endpoint
 output AZURE_COSMOS_DB_DATABASE_NAME string = database.outputs.name
+output AZURE_AI_SEARCH_INDEX string = 'products'

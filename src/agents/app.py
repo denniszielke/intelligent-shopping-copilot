@@ -1,55 +1,48 @@
 import os
 import dotenv
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-import streamlit as st
 import random
+from typing import Annotated, TypedDict, Literal, Any, List
+from typing_extensions import TypedDict
+
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from azure.core.credentials import AzureKeyCredential
+
+import streamlit as st
+from langchain_community.callbacks.streamlit import (
+    StreamlitCallbackHandler,
+)
+from openai import AzureOpenAI
 from langchain_openai import AzureChatOpenAI
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-
-from typing import Annotated, TypedDict
-
-
-from langgraph.graph.message import add_messages
-
-from typing import Annotated, Literal
-
-from langchain_core.messages import AIMessage
-from langchain_core.pydantic_v1 import BaseModel, Field
-from typing_extensions import TypedDict
-
-from langgraph.graph import END, StateGraph, START
-from langgraph.graph.message import AnyMessage, add_messages
-
-from typing import Any
-
-from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
-from langgraph.prebuilt import ToolNode
-from langchain_community.utilities import SQLDatabase
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
-from IPython.display import Image
 from langchain_core.runnables.graph import CurveStyle, MermaidDrawMethod, NodeStyles
+from langchain_core.prompts import PromptTemplate
+from langchain.agents import AgentExecutor, create_structured_chat_agent, create_react_agent
+from langchain import agents
+
+from langgraph.graph.message import add_messages
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.prebuilt import ToolNode
+
+from azure.search.documents import SearchClient
+from azure.search.documents.models import (
+    VectorizedQuery
+)
+
+from IPython.display import Image
 
 dotenv.load_dotenv()
 
-from opentelemetry import trace
-tracer = trace.get_tracer(__name__)
-
-# enable langchain instrumentation
-from opentelemetry.instrumentation.langchain import LangchainInstrumentor
-instrumentor = LangchainInstrumentor()
-if not instrumentor.is_instrumented_by_opentelemetry:
-    instrumentor.instrument()
-
 st.set_page_config(
-    page_title="AI agentic bot that can interact with a database"
+    page_title="AI agentic bot that to recommend products"
 )
 
-st.title("💬 AI agentic RAG")
-st.caption("🚀 A Bot that can use an agent to retrieve, augment, generate, validate and iterate")
+st.title("💬 AI shopping copilot")
+st.caption("🚀 A Bot that can recommend the right products for you")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -69,7 +62,9 @@ for message in st.session_state.chat_history:
             st.markdown(message.content)
 
 llm: AzureChatOpenAI = None
+client: AzureOpenAI = None
 embeddings_model: AzureOpenAIEmbeddings = None
+embedding_model = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL")
 if "AZURE_OPENAI_API_KEY" in os.environ:
     llm = AzureChatOpenAI(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -84,6 +79,11 @@ if "AZURE_OPENAI_API_KEY" in os.environ:
         openai_api_version = os.getenv("AZURE_OPENAI_VERSION"),
         model= os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY")
+    )
+    client = AzureOpenAI(
+        api_key = os.getenv("AZURE_OPENAI_API_KEY"),  
+        api_version = os.getenv("AZURE_OPENAI_VERSION"),
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     )
 else:
     token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
@@ -102,6 +102,19 @@ else:
         model= os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
         azure_ad_token_provider = token_provider
     )
+    client = AzureOpenAI(
+        azure_ad_token_provider=token_provider,
+        api_version = os.getenv("AZURE_OPENAI_VERSION"),
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+
+credential = AzureKeyCredential(os.environ["AZURE_AI_SEARCH_KEY"]) if len(os.environ["AZURE_AI_SEARCH_KEY"]) > 0 else DefaultAzureCredential()
+
+search_client = SearchClient(
+    endpoint=os.environ["AZURE_AI_SEARCH_ENDPOINT"], 
+    index_name=os.environ["AZURE_AI_SEARCH_INDEX"],
+    credential=credential
+)
 
 def get_session_id() -> str:
     id = random.randint(0, 1000000)
@@ -112,215 +125,126 @@ if "session_id" not in st.session_state:
     print("started new session: " + st.session_state["session_id"])
     st.write("You are running in session: " + st.session_state["session_id"])
 
-driver = '{ODBC Driver 18 for SQL Server}'
-odbc_str = 'mssql+pyodbc:///?odbc_connect=' \
-                'Driver='+driver+ \
-                ';' + os.getenv("AZURE_SQL_CONNECTIONSTRING")
 
-db = SQLDatabase.from_uri(odbc_str)
+def format_docs(docs):
+    return "\n\n".join([d.page_content for d in docs])
 
-def create_tool_node_with_fallback(tools: list) -> RunnableWithFallbacks[Any, dict]:
-    """
-    Create a ToolNode with a fallback to handle errors and surface them to the agent.
-    """
-    return ToolNode(tools).with_fallbacks(
-        [RunnableLambda(handle_tool_error)], exception_key="error"
-    )
-
-
-def handle_tool_error(state) -> dict:
-    error = state.get("error")
-    tool_calls = state["messages"][-1].tool_calls
-    return {
-        "messages": [
-            ToolMessage(
-                content=f"Error: {repr(error)}\n please fix your mistakes.",
-                tool_call_id=tc["id"],
-            )
-            for tc in tool_calls
-        ]
-    }
-
-toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-tools = toolkit.get_tools()
-
-list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
-get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
+# use an embeddingsmodel to create embeddings
+def get_embedding(text, model=embedding_model):
+    if len(text) == 0:
+        return client.embeddings.create(input = "no description", model=model).data[0].embedding
+    return client.embeddings.create(input = [text], model=model).data[0].embedding
 
 @tool
-def db_query_tool(query: str) -> str:
-    """
-    Execute a SQL Server query against the database and get back the result.
-    If the query is not correct, an error message will be returned.
-    If an error is returned, rewrite the query, check the query, and try again.
-    """
-    result = db.run_no_throw(query)
-    if not result:
-        return "Error: Query failed. Please rewrite your query and try again."
-    return result
+def search_for_product(question: str) -> str:
+    """This will return more detailed information about the products from the product repository Returns top 5 results."""
+    # create a vectorized query based on the question
+    vector = VectorizedQuery(vector=get_embedding(question), k_nearest_neighbors=5, fields="vector")
 
-query_check_system = """You are a SQL expert with a strong attention to detail.
-Double check the SQL Server query for common mistakes, including:
-- Using NOT IN with NULL values
-- Using UNION when UNION ALL should have been used
-- Using BETWEEN for exclusive ranges
-- Data type mismatch in predicates
-- Properly quoting identifiers
-- Using the correct number of arguments for functions
-- Casting to the correct data type
-- Using the proper columns for joins
-- Not using any create or drop statements
+    found_docs = list(search_client.search(
+        search_text=None,
+        query_type="semantic", query_answer="extractive",
+        query_answer_threshold=0.8,
+        semantic_configuration_name="products-semantic-config",
+        vector_queries=[vector],
+        select=["id", "name", "description", "category", "price"],
+        top=12
+    ))
 
-If there are any of the above mistakes, rewrite the query. If there are no mistakes, just reproduce the original query.
+    print(found_docs)
+    found_docs_as_text = " "
+    for doc in found_docs:   
+        print(doc) 
+        found_docs_as_text += " "+ "Name: {}".format(doc["name"]) +" "+ "Description: {}".format(doc["description"]) +" "+ "Price: {}".format(doc["price"]) + "Category: {}".format(doc["category"]) +" "
 
-You will call the appropriate tool to execute the query after running this check."""
+    return found_docs_as_text
 
-query_check_prompt = ChatPromptTemplate.from_messages(
-    [("system", query_check_system), ("placeholder", "{messages}")]
-)
-query_check = query_check_prompt | llm.bind_tools(
-    [db_query_tool], tool_choice="required"
-)
+@tool
+def get_last_purchases(user_id: Annotated[int, "the user id, which is int. Example 105"]) -> List[str]:
+    "Returns last 5 purchases of a customer, as List of strings. Call this tool with the user_id which is only a number."
+    print("Getting last purchases for userId: ", user_id)
+    return ["Lego City Police Station","Ultra-Thin Mechanical Keyboard"]
 
-query_check.invoke({"messages": [("user", "SELECT TOP 3 * FROM Orders")]})
+@tool
+def get_user_info(jwtToken: str) -> str:
+    "Returns current user/customers information. Name, Address is returned seperated by semi-colon. This function needs the current jwt from the user as parameter."
+    return "Name: Dennis; Address: Microsoft Street 1."
 
-# Define the state for the agent
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+@tool
+def get_user_id(jwtToken: str) -> int:
+    "Returns current user/customers user_id. This function needs the current jwt from the user as parameter."
+    return 1234
 
+@tool
+def get_jwt() -> int:
+    "Returns current user/customers jwt."
+    return " ABC1345"
 
-# Define a new graph
-workflow = StateGraph(State)
-
-
-# Add a node for the first tool call
-def first_tool_call(state: State) -> dict[str, list[AIMessage]]:
-    return {
-        "messages": [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "sql_db_list_tables",
-                        "args": {},
-                        "id": "tool_abcd123",
-                    }
-                ],
-            )
-        ]
-    }
+tools = [get_jwt, get_user_id, get_user_info, search_for_product, get_last_purchases]
 
 
-def model_check_query(state: State) -> dict[str, list[AIMessage]]:
-    """
-    Use this tool to double-check if your query is correct before executing it.
-    """
-    return {"messages": [query_check.invoke({"messages": [state["messages"][-1]]})]}
+prompt_template_v1 = """\
+Assistant is designed to be able to assist with a wide range of tasks, from answering simple questions to providing in-depth explanations and discussions on a wide range of topics. As a language model, Assistant is able to generate human-like text based on the input it receives, allowing it to engage in natural-sounding conversations and provide responses that are coherent and relevant to the topic at hand.
 
+You are talking to customers. Users and customers are the same thing for you.
 
-workflow.add_node("first_tool_call", first_tool_call)
+Assistant is able to process and understand large amounts of text, and can use this knowledge to provide accurate and informative responses to a wide range of questions. Additionally, Assistant is able to generate its own text based on the input it receives, allowing it to engage in discussions and provide explanations and descriptions on a wide range of topics.
 
-# Add nodes for the first two tools
-workflow.add_node(
-    "list_tables_tool", create_tool_node_with_fallback([list_tables_tool])
-)
-workflow.add_node("get_schema_tool", create_tool_node_with_fallback([get_schema_tool]))
+Overall, Assistant is a powerful tool that can help with a wide range of tasks and provide valuable insights and information on a wide range of topics. 
 
-# Add a node for a model to choose the relevant tables based on the question and available tables
-model_get_schema = llm.bind_tools(
-    [get_schema_tool]
-)
-workflow.add_node(
-    "model_get_schema",
-    lambda state: {
-        "messages": [model_get_schema.invoke(state["messages"])],
-    },
-)
+TOOLS:
 
-#-----------------------------------------------------------------------------------------------
+------
 
-# Add a node for a model to generate a query based on the question and schema
-query_gen_system = """You are a SQL expert with a strong attention to detail.
+Assistant has access to the following tools:
 
-Given an input question, output a syntactically correct SQL Server query.
+{tools}
 
-When generating the query:
+To use a tool, please use the following format:
 
-Unless the user specifies a specific number of examples they wish to obtain, always limit your query to at most 5 results.
-You can order the results by a relevant column to return the most interesting examples in the database.
-Never query for all the columns from a specific table, only ask for the relevant columns given the question.
+```
 
-If you have enough information to answer the input question, simply invoke the appropriate tool to submit the final answer to the user.
+Thought: Do I need to use a tool? Yes
 
-DO NOT make any DML statements (CREATE, INSERT, UPDATE, DELETE, DROP etc.) to the database."""
-query_gen_prompt = ChatPromptTemplate.from_messages(
-    [("system", query_gen_system), ("placeholder", "{messages}")]
-)
-query_gen = query_gen_prompt | llm
+Action: the action to take, should be one of [{tool_names}]
 
-def query_gen_node(state: State):
-    return {"messages": [query_gen.invoke(state)]}
+Action Input: the input to the action
 
+Observation: the result of the action
 
-workflow.add_node("query_gen", query_gen_node)
+```
 
-#-----------------------------------------------------------------------------------------------
+When you have a response to say to the Human, or if you do not need to use a tool, you MUST use the format:
 
-# Add a node for the model to check the query before executing it
-workflow.add_node("correct_query", model_check_query)
+```
 
-# Add node for executing the query
-workflow.add_node("execute_query", create_tool_node_with_fallback([db_query_tool]))
+Thought: Do I need to use a tool? No
 
-#-----------------------------------------------------------------------------------------------
+Final Answer: [your response here]
 
-format_system = """
-You receive an unformatted input message and need to format it into a human readable, meaningful response.
+```
 
-If the input message contains tabular data, you should format it into a table. 
-If the input message contains a list of items, you should format it into a list.
-If the input message contains a single item, you should format it into a sentence.
----
-{input}
+Begin!
+
+Previous conversation history:
+
+{chat_history}
+
+New input: {input}
+
+{agent_scratchpad}
 """
-format_prompt = ChatPromptTemplate.from_messages(
-    [("system", format_system), ("placeholder", "{input}")]
-)
-format_gen = format_prompt | llm
 
-def format_gen_node(state: State):
-    return {"messages": [format_gen.invoke({"input": [state["messages"][-1].content]})]}
+prompt = PromptTemplate.from_template(prompt_template_v1)
+agent = create_react_agent(llm, tools, prompt)
 
-workflow.add_node("format_gen", format_gen_node)
-
-#-----------------------------------------------------------------------------------------------
-
-# Define a conditional edge to decide whether to continue or end the workflow
-def should_continue(state: State) -> Literal["format_gen", "query_gen"]:
-    messages = state["messages"]
-    last_message = messages[-1]
-    if last_message.content.startswith("Error:"):
-        return "query_gen"
-    else:
-        return "format_gen"
-
-
-# Specify the edges between the nodes
-workflow.add_edge(START, "first_tool_call")
-workflow.add_edge("first_tool_call", "list_tables_tool")
-workflow.add_edge("list_tables_tool", "model_get_schema")
-workflow.add_edge("model_get_schema", "get_schema_tool")
-workflow.add_edge("get_schema_tool", "query_gen")
-workflow.add_edge("query_gen", "correct_query")
-workflow.add_edge("correct_query", "execute_query")
-workflow.add_conditional_edges(
-    "execute_query",
-    should_continue,
-)
-workflow.add_edge("format_gen", END)
-
-# Compile the workflow into a runnable
-app = workflow.compile()
+agent_executor = agents.AgentExecutor(
+        name="Tools Agent",
+        agent=agent, tools=tools, verbose=True, handle_parsing_errors=True, max_iterations=10, return_intermediate_steps=True, 
+        # handle errors
+        error_message="I'm sorry, I couldn't understand that. Please try again.",
+    )
+ 
 
 human_query = st.chat_input()
 
@@ -328,44 +252,10 @@ if human_query is not None and human_query != "":
 
     st.session_state.chat_history.append(HumanMessage(human_query))
 
-    inputs = {
-        "messages": [
-            ("user", human_query),
-        ]
-    }
-
-    with st.chat_message("Human"):
-        st.markdown(human_query)
-
-    with tracer.start_as_current_span("agent-chain") as span:
-        for event in app.stream(inputs):  
-            for value in event.values():
-                print(value)
-                message = value["messages"][-1]
-                if ( isinstance(message, AIMessage) ):
-                    print("AI:", message.content)
-                    with st.chat_message("Agent"):
-                        if (message.content == ''):
-                            toolusage = ''
-                            for tool in message.tool_calls:
-                                print(tool)
-                                toolusage += "name: " + tool["name"] + "  \n\n"
-                            st.write("Using the following tools: \n", toolusage)
-                        else:
-                            st.write(message.content)
-                
-                if ( isinstance(message, ToolMessage) ):
-                    print("Tool:", message.content)
-                    with st.chat_message("Tool"):
-                        st.write(message.content.replace('\n\n', ''))
-        span.set_attribute("llm.usage.completion_tokens",5) 
-        span.set_attribute("llm.usage.prompt_tokens", 100) 
-        span.set_attribute("llm.usage.total_tokens", 150) 
-
-    with st.chat_message("Agent"):
-        st.write("The conversation has ended. Those were the steps taken to answer your query.")
-        st.image(
-            app.get_graph(xray=True).draw_mermaid_png(
-                draw_method=MermaidDrawMethod.API,
-            )
+    with st.chat_message("assistant"):
+        st_callback = StreamlitCallbackHandler(st.container())
+        response = agent_executor.invoke(
+            {"input": human_query, "chat_history": st.session_state.chat_history}, {"callbacks": [st_callback]}, 
         )
+
+        ai_response = st.write(response["output"])
