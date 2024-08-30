@@ -10,4 +10,3 @@ langchain_community==0.2.14
 langgraph==0.2.14
 ipython==8.26.0
 azure-search-documents==11.5.1
-tiktoken==0.7.0
