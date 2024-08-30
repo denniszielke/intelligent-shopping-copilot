@@ -1,0 +1,32 @@
+
+
+## Datamodel
+
+Purchase History: # Last 10 product descriptions
+Customer Profile: # Persona, age group, has kids, preferences: List (based on last purchases)
+Observed Behaviour: # Interested topics, ad tracking data
+
+## flow
+
+- "Recommend me something based on my purchase history"
+
+- "I am looking for a product like X, but for me"
+
+- "I bought X what else should I buy"
+
+- "Recommend a gift for persona Y"
+
+- "Chit chat"
+
+- "Why should I buy X over Y"
+
+- "I want X but in a price range A-B"
+
+## agents
+
+- gossip/ chit chat bot
+
+- comparision agent
+
+- inventory agent
+
