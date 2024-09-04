@@ -6,7 +6,7 @@ param tags object = {}
 
 @allowed(['GlobalDocumentDB', 'MongoDB', 'Parse'])
 @description('Sets the kind of account.')
-param kind string = 'GlobalDocumentDB'
+param kind string = 'MongoDB'
 
 @description('Enables serverless for this account. Defaults to false.')
 param enableServerless bool = true
@@ -20,8 +20,8 @@ param disableKeyBasedAuth bool = false
 resource account 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
   name: name
   location: location
-  tags: tags
   kind: kind
+  tags: tags
   properties: {
     consistencyPolicy: {
       defaultConsistencyLevel: 'Session'
@@ -34,11 +34,12 @@ resource account 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
         isZoneRedundant: false
       }
     ]
+    publicNetworkAccess: 'Enabled'
     enableAutomaticFailover: false
     enableMultipleWriteLocations: false
     apiProperties: (kind == 'MongoDB')
       ? {
-          serverVersion: '4.2'
+          serverVersion: '7.0'
         }
       : {}
     disableLocalAuth: disableKeyBasedAuth
@@ -47,6 +48,13 @@ resource account 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
         ? [
             {
               name: 'EnableServerless'
+            }
+          ]
+        : [],
+      (kind == 'MongoDB')
+        ? [
+            {
+              name: 'EnableMongo'
             }
           ]
         : [],
@@ -63,3 +71,4 @@ resource account 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
 
 output endpoint string = account.properties.documentEndpoint
 output name string = account.name
+output connectionString string = account.listConnectionStrings().connectionStrings[0].connectionString

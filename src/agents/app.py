@@ -1,5 +1,6 @@
 import os
 import dotenv
+import pymongo
 import random
 from typing import Annotated, TypedDict, Literal, Any, List, Dict
 from pydantic import BaseModel, Field
@@ -93,8 +94,10 @@ for message in st.session_state.chat_history:
             st.markdown(message.content)
 
 llm: AzureChatOpenAI = None
-client: AzureOpenAI = None
+openai: AzureOpenAI = None
 embeddings_model: AzureOpenAIEmbeddings = None
+mongodb_client = None
+
 embedding_model = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL")
 if "AZURE_OPENAI_API_KEY" in os.environ:
     llm = AzureChatOpenAI(
@@ -112,7 +115,7 @@ if "AZURE_OPENAI_API_KEY" in os.environ:
         model= os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY")
     )
-    client = AzureOpenAI(
+    openai = AzureOpenAI(
         api_key = os.getenv("AZURE_OPENAI_API_KEY"),  
         api_version = os.getenv("AZURE_OPENAI_VERSION"),
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -135,7 +138,7 @@ else:
         model= os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
         azure_ad_token_provider = token_provider
     )
-    client = AzureOpenAI(
+    openai = AzureOpenAI(
         azure_ad_token_provider=token_provider,
         api_version = os.getenv("AZURE_OPENAI_VERSION"),
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -148,6 +151,14 @@ search_client = SearchClient(
     index_name=os.environ["AZURE_AI_SEARCH_INDEX"],
     credential=credential
 )
+
+mongodb_client = pymongo.MongoClient(os.environ["AZURE_COSMOS_DB_CONNECTIONSTRING"])
+mongodb_database = os.environ["AZURE_COSMOS_DB_DATABASE_NAME"]
+db = mongodb_client[mongodb_database]
+if mongodb_database not in mongodb_client.list_database_names():
+    print("Created db '{}' with shared throughput.\n".format(mongodb_database))
+else:
+    print("Using database: '{}'.\n".format(mongodb_database))
 
 def get_session_id() -> str:
     id = random.randint(0, 1000000)
@@ -177,8 +188,8 @@ def format_docs(docs):
 # use an embeddingsmodel to create embeddings
 def get_embedding(text, model=embedding_model):
     if len(text) == 0:
-        return client.embeddings.create(input = "no description", model=model).data[0].embedding
-    return client.embeddings.create(input = [text], model=model).data[0].embedding
+        return openai.embeddings.create(input = "no description", model=model).data[0].embedding
+    return openai.embeddings.create(input = [text], model=model).data[0].embedding
 
 @tool
 def search_for_product(question: str) -> str:
